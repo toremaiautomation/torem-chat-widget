@@ -1,0 +1,834 @@
+import { useState, useEffect, useRef } from "react";
+import { motion, AnimatePresence } from "framer-motion";
+import { Send, ThumbsUp, ThumbsDown, Calendar, X, Copy, Check, ChevronLeft, ChevronRight } from "lucide-react";
+
+// Inlined from torem-website/src/theme.js
+const DISPLAY = "'Bricolage Grotesque', 'Georgia', serif";
+const BODY    = "'DM Sans', system-ui, -apple-system, sans-serif";
+
+// Fixed for all clients — routing is done via clientId in the payload, not the URL
+const CHAT_WEBHOOK_URL = "https://toremai.app.n8n.cloud/webhook/torem-chat";
+
+// Copied exactly from theme.js buildCSS() — the three rules ChatWidget depends on
+const WIDGET_CSS = `
+@keyframes glowPulse {
+  0%, 100% { opacity: 0.5; }
+  50%       { opacity: 1.0; }
+}
+@keyframes blink {
+  0%, 100% { opacity: 1; }
+  50%       { opacity: 0; }
+}
+.chat-chip:hover {
+  background: #EBF2FF !important;
+  border-color: rgba(0,122,227,0.55) !important;
+}
+`;
+
+const ALL_SUGGESTIONS = [
+  "What's your most popular plan?", "Is there a setup fee?", "Do you offer a free trial?",
+  "Can I switch plans later?", "What's the cheapest option?", "Do you require a contract?",
+  "How accurate is the AI?", "What happens when AI can't answer?", "Can I customize AI responses?",
+  "Does it sound robotic or natural?", "Can it handle multiple languages?", "What if a customer gets frustrated?",
+  "What CRMs do you support?", "Can it sync with Google Calendar?", "How long does integration take?",
+  "Does it work with Shopify?", "Can it connect to my existing website?", "What about Zapier integration?",
+  "What do I need to provide?", "Will there be any downtime?", "How long until it's live?",
+  "Do I need any technical skills?", "Can I make changes after launch?", "Who handles the setup?",
+  "How does 24/7 answering work?", "What if the AI makes a mistake?", "Can I monitor calls?",
+  "Does it work on weekends?", "What happens during business hours?", "Can I take over a call manually?",
+  "How fast does it respond to leads?", "What happens to missed calls?", "Can I see captured leads?",
+  "Does it qualify leads automatically?", "What info does it collect?", "Can it text leads back instantly?",
+  "How does booking automation work?", "Can it sync with my calendar?", "What about rescheduling?",
+  "Does it send reminders?", "Can customers book directly?", "What if I'm fully booked?",
+  "Do you work with retail businesses?", "Do you support service businesses?", "What about restaurants?",
+  "Does this work for healthcare practices?", "Can solo business owners use this?", "What about multi-location businesses?",
+  "How do I get started?", "Can I see a demo?", "What makes Torem different?",
+  "How much support do I get?", "Can I talk to a real person?", "What's the next step?",
+];
+
+const POST_BOOKING_SUGGESTIONS = [
+  "What services do you offer?",
+  "How does the AI agent work?",
+  "Tell me more about pricing",
+];
+
+const BOOKING_INTENT_RE = /\b(book|schedule|appointment|call|available|calendar)\b/i;
+
+function hexToRgb(hex) {
+  const h = hex.replace("#", "");
+  const r = parseInt(h.slice(0, 2), 16);
+  const g = parseInt(h.slice(2, 4), 16);
+  const b = parseInt(h.slice(4, 6), 16);
+  return `${r},${g},${b}`;
+}
+
+function parseSlots(text) {
+  const slots = [];
+  const re = /^\s*\d+[.)]\s*(.+)$/gm;
+  let m;
+  while ((m = re.exec(text)) !== null) slots.push(m[1].trim());
+  return slots.length >= 2 ? slots : [];
+}
+
+function slotPreamble(text) {
+  return text.replace(/^\s*\d+[.)]\s*.+$/gm, "").trim();
+}
+
+function getSuggestions(pool, usedSuggestions) {
+  const remaining = pool.filter(s => !usedSuggestions.includes(s));
+  if (remaining.length < 3) {
+    return [...pool].sort(() => Math.random() - 0.5).slice(0, 3);
+  }
+  return [...remaining].sort(() => Math.random() - 0.5).slice(0, 3);
+}
+
+function BookingCalendar({ availableDays, msgIndex, onPickSlot, slotsUsed, primaryColor, navyColor }) {
+  const today = new Date();
+  today.setHours(0, 0, 0, 0);
+  const maxDate = new Date(today);
+  maxDate.setDate(maxDate.getDate() + 30);
+
+  const parseDate = (str) => { const [y, m, d] = str.split("-"); return new Date(+y, +m - 1, +d); };
+  const formatDate = (d) => `${d.getFullYear()}-${String(d.getMonth()+1).padStart(2,"0")}-${String(d.getDate()).padStart(2,"0")}`;
+
+  const firstAvail = availableDays.length > 0 ? parseDate(availableDays[0].date) : today;
+  const [viewYear, setViewYear] = useState(firstAvail.getFullYear());
+  const [viewMonth, setViewMonth] = useState(firstAvail.getMonth());
+  const [selectedDate, setSelectedDate] = useState(null);
+
+  const availableMap = new Map(availableDays.map((d) => [d.date, d]));
+
+  const goPrev = () => { const d = new Date(viewYear, viewMonth - 1, 1); setViewYear(d.getFullYear()); setViewMonth(d.getMonth()); setSelectedDate(null); };
+  const goNext = () => { const d = new Date(viewYear, viewMonth + 1, 1); setViewYear(d.getFullYear()); setViewMonth(d.getMonth()); setSelectedDate(null); };
+
+  const hasInMonth = (year, month) => availableDays.some((d) => { const dd = parseDate(d.date); return dd.getFullYear() === year && dd.getMonth() === month; });
+  const prevD = new Date(viewYear, viewMonth - 1, 1);
+  const nextD = new Date(viewYear, viewMonth + 1, 1);
+  const canGoPrev = hasInMonth(prevD.getFullYear(), prevD.getMonth());
+  const canGoNext = hasInMonth(nextD.getFullYear(), nextD.getMonth());
+
+  const monthLabel = new Date(viewYear, viewMonth, 1).toLocaleString("en-US", { month: "long", year: "numeric" });
+  const daysInMonth = new Date(viewYear, viewMonth + 1, 0).getDate();
+  const startDow = new Date(viewYear, viewMonth, 1).getDay();
+  const cells = [];
+  for (let i = 0; i < startDow; i++) cells.push(null);
+  for (let d = 1; d <= daysInMonth; d++) cells.push(new Date(viewYear, viewMonth, d));
+
+  const selectedDateStr = selectedDate ? formatDate(selectedDate) : null;
+  const selectedDayData = selectedDateStr ? availableMap.get(selectedDateStr) : null;
+
+  return (
+    <div style={{ background: "#FFFFFF", border: "1px solid rgba(0,122,227,0.15)", borderRadius: "12px", padding: "16px", width: "100%", boxSizing: "border-box", fontFamily: BODY }}>
+      <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: "10px" }}>
+        <button onClick={goPrev} disabled={!canGoPrev} style={{ background: "none", border: "none", cursor: canGoPrev ? "pointer" : "default", color: canGoPrev ? primaryColor : "#D3E0F0", padding: "2px 6px", borderRadius: "4px", fontSize: "20px", lineHeight: 1 }}><ChevronLeft size={16} /></button>
+        <span style={{ fontSize: "13px", fontWeight: 700, color: navyColor }}>{monthLabel}</span>
+        <button onClick={goNext} disabled={!canGoNext} style={{ background: "none", border: "none", cursor: canGoNext ? "pointer" : "default", color: canGoNext ? primaryColor : "#D3E0F0", padding: "2px 6px", borderRadius: "4px", fontSize: "20px", lineHeight: 1 }}><ChevronRight size={16} /></button>
+      </div>
+      <div style={{ display: "grid", gridTemplateColumns: "repeat(7, 1fr)", gap: "3px", marginBottom: "4px" }}>
+        {["Su","Mo","Tu","We","Th","Fr","Sa"].map((d) => (
+          <div key={d} style={{ textAlign: "center", fontSize: "11px", color: "#94a3b8", fontWeight: 600, padding: "4px 0" }}>{d}</div>
+        ))}
+      </div>
+      <div style={{ display: "grid", gridTemplateColumns: "repeat(7, 1fr)", gap: "3px" }}>
+        {cells.map((d, i) => {
+          if (!d) return <div key={`pad-${i}`} />;
+          const dateStr = formatDate(d);
+          const isAvail = availableMap.has(dateStr);
+          const inWin = d >= today && d <= maxDate;
+          const isActive = isAvail && inWin;
+          const isSelected = dateStr === selectedDateStr;
+          return (
+            <button key={dateStr} onClick={() => isActive && !slotsUsed && setSelectedDate(d)} style={{
+              padding: "8px 2px", borderRadius: "8px",
+              border: isSelected ? `2px solid ${primaryColor}` : isActive ? "1px solid rgba(0,122,227,0.18)" : "1px solid transparent",
+              background: isSelected ? primaryColor : isActive ? "rgba(0,122,227,0.06)" : "transparent",
+              color: isSelected ? "#FFFFFF" : isActive ? navyColor : "#C8D5E0",
+              fontSize: "13px", fontWeight: isActive ? 600 : 400,
+              cursor: isActive && !slotsUsed ? "pointer" : "default",
+              fontFamily: BODY, textAlign: "center", transition: "background 0.12s, border 0.12s",
+            }}>{d.getDate()}</button>
+          );
+        })}
+      </div>
+      {selectedDayData && !slotsUsed && (
+        <div style={{ marginTop: "14px", borderTop: "1px solid rgba(0,122,227,0.1)", paddingTop: "14px" }}>
+          <div style={{ fontSize: "11px", fontWeight: 700, color: navyColor, marginBottom: "8px", textTransform: "uppercase", letterSpacing: "0.05em" }}>
+            {selectedDayData.dayLabel}
+          </div>
+          <div style={{ display: "flex", flexWrap: "wrap", gap: "7px" }}>
+            {selectedDayData.slots.map((slot, si) => (
+              <button key={si} onClick={() => onPickSlot(msgIndex, `${selectedDayData.dayLabel} at ${slot}`)} style={{
+                background: "#EBF2FF", border: `1px solid ${primaryColor}`, borderRadius: "8px",
+                padding: "7px 14px", fontSize: "13px", color: primaryColor,
+                fontWeight: 600, cursor: "pointer", fontFamily: BODY, transition: "background 0.12s",
+              }}>{slot}</button>
+            ))}
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
+
+export default function ChatWidget({ config }) {
+  // Inject required CSS (keyframes + chip hover) on mount
+  useEffect(() => {
+    if (!document.getElementById("torem-widget-styles")) {
+      const style = document.createElement("style");
+      style.id = "torem-widget-styles";
+      style.textContent = WIDGET_CSS;
+      document.head.appendChild(style);
+    }
+    if (!document.getElementById("torem-widget-fonts")) {
+      const link = document.createElement("link");
+      link.id = "torem-widget-fonts";
+      link.rel = "stylesheet";
+      link.href = "https://fonts.googleapis.com/css2?family=Bricolage+Grotesque:wght@400..800&family=DM+Sans:wght@400..700&display=swap";
+      document.head.appendChild(link);
+    }
+    return () => {
+      document.getElementById("torem-widget-styles")?.remove();
+      document.getElementById("torem-widget-fonts")?.remove();
+    };
+  }, []);
+
+  const rgb = hexToRgb(config.primaryColor);
+  const C = {
+    bg: "#FFFFFF", headerBg: "#FFFFFF", headerBorder: "#E8EFF8",
+    msgBg: "#F1F5F9",
+    inputBg: "#FFFFFF", inputBorder: "#D3E0F0",
+    text: config.navyColor, textMuted: "#5C6E84", border: "#E2E8F0",
+    sugBg: "#FFFFFF", sugBorder: `rgba(${rgb},0.28)`, sugText: config.primaryColor,
+    actionText: "#94a3b8",
+  };
+
+  const DEFAULT_SUGGESTIONS = config.defaultSuggestions;
+  const followUpPool        = config.followUpSuggestions    || ALL_SUGGESTIONS;
+  const postBookingPool     = config.postBookingSuggestions || POST_BOOKING_SUGGESTIONS;
+
+  const [open, setOpen] = useState(false);
+  const [messages, setMessages] = useState([]);
+  const [input, setInput] = useState("");
+  const [thinking, setThinking] = useState(false);
+  const [isMobile, setIsMobile] = useState(window.innerWidth < 768);
+  const [suggestions, setSuggestions] = useState(DEFAULT_SUGGESTIONS);
+  const [sugsVisible, setSugsVisible] = useState(true);
+  const [usedSuggestions, setUsedSuggestions] = useState([]);
+  const [feedback, setFeedback] = useState({});
+  const [copied, setCopied] = useState({});
+  const [copiedLast, setCopiedLast] = useState(false);
+  const [showSkeleton, setShowSkeleton] = useState(false);
+  const [thinkingMode, setThinkingMode] = useState("normal");
+  const [chatSize, setChatSize] = useState({ width: 400, height: 600 });
+
+  const sessionId   = useRef(String(Date.now()));
+  const chatEndRef  = useRef(null);
+  const inputRef    = useRef(null);
+  const typingRef   = useRef(null);
+  const isResizing  = useRef(false);
+  const resizeStart = useRef({ x: 0, y: 0, w: 0, h: 0 });
+
+  useEffect(() => {
+    const fn = () => setIsMobile(window.innerWidth < 768);
+    window.addEventListener("resize", fn);
+    return () => window.removeEventListener("resize", fn);
+  }, []);
+
+  useEffect(() => {
+    if (chatEndRef.current) chatEndRef.current.scrollIntoView({ behavior: "smooth" });
+  }, [messages, thinking]);
+
+  useEffect(() => {
+    if (open) {
+      setShowSkeleton(true);
+      setTimeout(() => setShowSkeleton(false), 500);
+      setTimeout(() => inputRef.current?.focus(), 50);
+    }
+  }, [open]);
+
+  useEffect(() => {
+    const lastMsg = messages[messages.length - 1];
+    if (lastMsg?.sender === "bot" && lastMsg?.typing === false) {
+      setSugsVisible(false);
+      if (lastMsg.isConfirmation) {
+        setSuggestions(postBookingPool);
+      } else {
+        const next = getSuggestions(followUpPool, usedSuggestions);
+        setSuggestions(next);
+        setUsedSuggestions(prev => {
+          const updated = [...new Set([...prev, ...next])];
+          if (updated.length >= ALL_SUGGESTIONS.length - 3) return [];
+          return updated;
+        });
+      }
+      setTimeout(() => setSugsVisible(true), 80);
+    }
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [messages]);
+
+  useEffect(() => {
+    const onMove = (e) => {
+      if (!isResizing.current) return;
+      const dx = e.clientX - resizeStart.current.x;
+      const dy = e.clientY - resizeStart.current.y;
+      setChatSize({
+        width:  Math.min(600, Math.max(320, resizeStart.current.w - dx)),
+        height: Math.min(800, Math.max(400, resizeStart.current.h - dy)),
+      });
+    };
+    const onUp = () => { isResizing.current = false; };
+    window.addEventListener("mousemove", onMove);
+    window.addEventListener("mouseup",   onUp);
+    return () => {
+      window.removeEventListener("mousemove", onMove);
+      window.removeEventListener("mouseup",   onUp);
+    };
+  }, []);
+
+  const startResize = (e) => {
+    e.preventDefault();
+    isResizing.current = true;
+    resizeStart.current = { x: e.clientX, y: e.clientY, w: chatSize.width, h: chatSize.height };
+  };
+
+  const sendToN8N = async (userMessage) => {
+    try {
+      const response = await fetch(CHAT_WEBHOOK_URL, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          message:   userMessage,
+          sessionId: sessionId.current,
+          clientId:  config.clientId,   // routes to this client's config + calendar
+        }),
+      });
+
+      const text = await response.text();
+      let aiMessage = `I'm here to help! Email us at ${config.contactEmail}`;
+      let availableDays = null;
+
+      if (!text || text.trim() === "") {
+        return { aiMessage: `Sorry, something went wrong. Please try again or email ${config.contactEmail}`, availableDays: null };
+      }
+
+      try {
+        const data = JSON.parse(text);
+        if (data.ai_response) aiMessage = data.ai_response;
+        else if (data.message) aiMessage = data.message;
+        else if (Array.isArray(data) && data[0]?.ai_response) aiMessage = data[0].ai_response;
+        let rawAvailableDays = data.availableDays || (Array.isArray(data) && data[0]?.availableDays);
+        if (rawAvailableDays) {
+          try {
+            availableDays = typeof rawAvailableDays === "string" ? JSON.parse(rawAvailableDays) : rawAvailableDays;
+          } catch(e) { availableDays = null; }
+        }
+      } catch(e) {
+        if (text.length > 0 && !text.startsWith("{")) aiMessage = text;
+      }
+
+      return { aiMessage, availableDays };
+    } catch (err) {
+      return { aiMessage: `Connection issue — please try again or email ${config.contactEmail}`, availableDays: null };
+    }
+  };
+
+  const startTyping = (fullText, availableDays = null) => {
+    clearInterval(typingRef.current);
+    const slots = config.enabledWorkflows.booking ? parseSlots(fullText) : [];
+    const isConfirmation = config.enabledWorkflows.booking && /You're booked for/i.test(fullText);
+    const displayText = slots.length > 0 ? (slotPreamble(fullText) || "Here are the available times:") : fullText;
+    setMessages(prev => [...prev, {
+      sender: "bot", text: "", fullText: displayText, typing: true,
+      slots: slots.length > 0 ? slots : null,
+      availableDays: availableDays && availableDays.length > 0 ? availableDays : null,
+      isConfirmation,
+      slotsUsed: false,
+    }]);
+    let i = 0;
+    typingRef.current = setInterval(() => {
+      i++;
+      setMessages(prev => {
+        const msgs = [...prev];
+        const last = msgs[msgs.length - 1];
+        if (!last || !last.typing) { clearInterval(typingRef.current); return prev; }
+        if (i >= displayText.length) {
+          clearInterval(typingRef.current);
+          msgs[msgs.length - 1] = { ...last, text: displayText, typing: false };
+        } else {
+          msgs[msgs.length - 1] = { ...last, text: displayText.slice(0, i) };
+        }
+        return msgs;
+      });
+    }, 15);
+  };
+
+  const sendMessage = async (text) => {
+    const msg = text.trim();
+    if (!msg || thinking) return;
+    setThinkingMode(config.enabledWorkflows.booking && BOOKING_INTENT_RE.test(msg) ? "booking" : "normal");
+    setMessages(prev => [...prev, { sender: "user", text: msg }]);
+    setInput("");
+    setThinking(true);
+    const { aiMessage, availableDays } = await sendToN8N(msg);
+    setThinking(false);
+    startTyping(aiMessage, availableDays);
+  };
+
+  const pickSlot = (msgIndex, slot) => {
+    setMessages(prev => prev.map((m, i) => i === msgIndex ? { ...m, slotsUsed: true } : m));
+    sendMessage(`I'll take ${slot}`);
+  };
+
+  const retryLast = async () => {
+    if (thinking) return;
+    const lastUser = [...messages].reverse().find(m => m.sender === "user");
+    if (!lastUser) return;
+    setMessages(prev => prev.slice(0, -1));
+    setThinking(true);
+    const { aiMessage, availableDays } = await sendToN8N(lastUser.text);
+    setThinking(false);
+    startTyping(aiMessage, availableDays);
+  };
+
+  const handleKey = e => {
+    if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); sendMessage(input); }
+  };
+
+  const clearChat = () => {
+    setMessages([]);
+    setSuggestions(DEFAULT_SUGGESTIONS);
+    setUsedSuggestions([]);
+    setFeedback({});
+    setCopied({});
+    setInput("");
+  };
+
+  const copyMsg = (i, text) => {
+    navigator.clipboard.writeText(text).catch(() => {});
+    setCopied(prev => ({ ...prev, [i]: true }));
+    setTimeout(() => setCopied(prev => ({ ...prev, [i]: false })), 2000);
+  };
+
+  const copyLast = () => {
+    const lastBot = [...messages].reverse().find(m => m.sender === "bot" && !m.isError);
+    if (!lastBot) return;
+    navigator.clipboard.writeText(lastBot.text).catch(() => {});
+    setCopiedLast(true);
+    setTimeout(() => setCopiedLast(false), 2000);
+  };
+
+  const hRad = isMobile ? 0 : "16px 16px 0 0";
+  const fRad = isMobile ? 0 : "0 0 16px 16px";
+
+  const winStyle = {
+    position: "fixed", zIndex: 9998,
+    background: C.bg, display: "flex", flexDirection: "column",
+    boxShadow: "0 20px 60px rgba(0,0,0,0.2)",
+    ...(isMobile ? {
+      bottom: "80px", right: "16px", left: "16px",
+      width: "calc(100vw - 32px)", height: "75vh",
+      borderRadius: "16px",
+      boxShadow: "0 8px 32px rgba(0,0,0,0.25)",
+      overflow: "hidden",
+    } : {
+      bottom: "90px", right: "24px",
+      width: `${chatSize.width}px`, height: `${chatSize.height}px`,
+      borderRadius: "16px",
+    }),
+  };
+
+  const greeting = config.greeting
+    || `Hi there! I'm the ${config.businessName} assistant. How can I help you today?`;
+
+  return (
+    <>
+      {open && (
+        <div style={winStyle}>
+          {/* Resize handle (desktop only) */}
+          {!isMobile && (
+            <div
+              onMouseDown={startResize}
+              title="Drag to resize"
+              style={{
+                position: "absolute", top: 0, left: 0, zIndex: 10,
+                width: "22px", height: "22px", cursor: "nw-resize",
+                borderRadius: "16px 0 6px 0",
+                display: "flex", alignItems: "center", justifyContent: "center",
+              }}
+            >
+              <svg width="10" height="10" viewBox="0 0 10 10" fill="none">
+                <path d="M1 4L4 1M1 7L7 1M4 7L7 4" stroke="rgba(11,31,58,0.3)" strokeWidth="1.3" strokeLinecap="round"/>
+              </svg>
+            </div>
+          )}
+
+          {/* Header */}
+          <div style={{
+            background: C.headerBg, padding: "14px 16px",
+            display: "flex", alignItems: "center", gap: "10px",
+            borderRadius: hRad, flexShrink: 0,
+            borderBottom: `1px solid ${C.headerBorder}`,
+          }}>
+            <div style={{ width: "38px", height: "38px", borderRadius: "50%", flexShrink: 0, overflow: "hidden", boxShadow: `0 0 0 2px rgba(${rgb},0.2), 0 2px 8px rgba(0,0,0,0.1)` }}>
+              <img src={config.logoUrl} alt={config.businessName} style={{ width: "100%", height: "100%", objectFit: "cover", display: "block" }} />
+            </div>
+            <div style={{ flex: 1, minWidth: 0 }}>
+              <div style={{ display: "flex", alignItems: "center", gap: "5px" }}>
+                <span style={{ fontFamily: DISPLAY, fontSize: "13px", fontWeight: 700, color: config.navyColor }}>{config.businessName}</span>
+                <span style={{ width: "6px", height: "6px", borderRadius: "50%", background: "#34d399", flexShrink: 0 }} />
+                <span style={{ fontSize: "10px", color: C.textMuted }}>Online</span>
+              </div>
+              <div style={{ fontSize: "10px", color: C.textMuted, opacity: 0.7, marginTop: "1px" }}>
+                Always here to help
+              </div>
+            </div>
+            <button onClick={() => setOpen(false)} aria-label="Close chat" style={{
+              background: "rgba(11,31,58,0.06)", border: "none", color: config.navyColor,
+              width: "28px", height: "28px", borderRadius: "50%",
+              display: "flex", alignItems: "center", justifyContent: "center",
+              cursor: "pointer", fontSize: "12px", flexShrink: 0,
+              transition: "background 0.15s",
+            }}><X size={18} /></button>
+          </div>
+
+          {/* Messages */}
+          <div style={{
+            flex: 1, overflowY: "auto", padding: "12px",
+            display: "flex", flexDirection: "column", gap: "8px",
+            background: C.bg,
+          }}>
+            {showSkeleton && messages.length === 0 && (
+              <div style={{ display: "flex", flexDirection: "column", gap: "8px" }}>
+                {[75, 50, 65].map((w, i) => (
+                  <div key={i} style={{
+                    height: i === 0 ? "44px" : "32px", background: C.msgBg,
+                    borderRadius: "12px", width: `${w}%`, opacity: 0.5,
+                    animation: "glowPulse 1.2s ease-in-out infinite",
+                  }} />
+                ))}
+              </div>
+            )}
+
+            {!showSkeleton && messages.length === 0 && !thinking && (
+              <div style={{
+                background: "#FFFFFF", borderRadius: "20px 20px 20px 4px",
+                padding: "12px 14px", fontSize: "13px", color: C.text,
+                lineHeight: 1.6, maxWidth: "85%",
+                border: "1px solid rgba(0,122,227,0.1)",
+                boxShadow: "0 2px 10px rgba(0,0,0,0.05)",
+              }}>
+                {greeting}
+              </div>
+            )}
+
+            <AnimatePresence initial={false}>
+            {messages.map((m, i) => (
+              <motion.div
+                key={i}
+                initial={{ opacity: 0, y: 12, scale: 0.96, x: m.sender === "user" ? 20 : -20 }}
+                animate={{ opacity: 1, y: 0, scale: 1, x: 0 }}
+                transition={{ duration: 0.35, ease: [0.22, 1, 0.36, 1] }}
+                style={{ display: "flex", flexDirection: "column", alignItems: m.sender === "user" ? "flex-end" : "flex-start", gap: "6px", width: "100%" }}
+              >
+                {m.isConfirmation && !m.typing ? (
+                  <div style={{
+                    background: "#f0fdf4", border: "1px solid #86efac",
+                    borderRadius: "16px", padding: "14px 16px",
+                    display: "flex", flexDirection: "column", gap: "8px",
+                    maxWidth: "88%",
+                  }}>
+                    <div style={{ display: "flex", alignItems: "center", gap: "8px" }}>
+                      <div style={{ width: "20px", height: "20px", borderRadius: "50%", background: "#16a34a", display: "flex", alignItems: "center", justifyContent: "center" }}>
+                        <svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="white" strokeWidth="3" strokeLinecap="round" strokeLinejoin="round"><polyline points="20 6 9 17 4 12"/></svg>
+                      </div>
+                      <span style={{ fontFamily: DISPLAY, fontSize: "14px", fontWeight: 700, color: "#16a34a" }}>Booking Confirmed!</span>
+                    </div>
+                    <p style={{ fontSize: "13px", color: "#166534", lineHeight: 1.5 }}>{m.text}</p>
+                    <p style={{ fontSize: "11px", color: "#15803d", opacity: 0.85 }}>You'll receive a confirmation shortly.</p>
+                  </div>
+                ) : (
+                  <>
+                    <div style={{ display: "flex", alignItems: "flex-end", gap: "8px" }}>
+                      {m.sender !== "user" && !m.isError && (
+                        <div style={{
+                          width: "28px", height: "28px", borderRadius: "50%",
+                          flexShrink: 0, overflow: "hidden",
+                          boxShadow: "0 2px 8px rgba(0,0,0,0.15)",
+                        }}>
+                          <img src={config.logoUrl} alt="" style={{ width: "100%", height: "100%", objectFit: "cover", display: "block" }} />
+                        </div>
+                      )}
+                      <motion.div
+                        whileHover={{ scale: 1.01, y: -1 }}
+                        transition={{ duration: 0.2, ease: "easeOut" }}
+                        style={{ position: "relative", maxWidth: "83%" }}
+                      >
+                        <div style={{
+                          padding: "10px 13px",
+                          borderRadius: m.sender === "user" ? "20px 20px 4px 20px" : "20px 20px 20px 4px",
+                          background: m.sender === "user" ? config.primaryColor : (m.isError ? "#FEF2F2" : "#FFFFFF"),
+                          color: m.sender === "user" ? "#FFFFFF" : (m.isError ? "#991B1B" : C.text),
+                          fontSize: "13px", lineHeight: 1.6,
+                          border: m.sender === "user" ? "none" : (m.isError ? "1px solid #FECACA" : "1px solid rgba(0,122,227,0.1)"),
+                          boxShadow: m.sender === "user"
+                            ? `0 8px 20px -4px rgba(${rgb},0.35)`
+                            : "0 2px 10px rgba(0,0,0,0.05)",
+                        }}>
+                          {m.text}
+                          {m.typing && (
+                            <span style={{
+                              display: "inline-block", width: "2px", height: "14px",
+                              background: C.textMuted, marginLeft: "2px",
+                              verticalAlign: "text-bottom",
+                              animation: "blink 0.8s step-end infinite",
+                            }} />
+                          )}
+                          {m.isError && (
+                            <button onClick={retryLast} style={{
+                              display: "block", marginTop: "7px",
+                              background: "#DC2626", color: "#FFFFFF", border: "none",
+                              borderRadius: "6px", padding: "3px 10px",
+                              fontSize: "11px", cursor: "pointer", fontFamily: BODY,
+                            }}>Retry</button>
+                          )}
+                        </div>
+                        {m.sender === "bot" && !m.isError && !m.typing && (
+                          <button onClick={() => copyMsg(i, m.text)} title="Copy" style={{
+                            position: "absolute", top: "4px", right: "-22px",
+                            background: "none", border: "none", cursor: "pointer",
+                            color: copied[i] ? "#34d399" : C.textMuted,
+                            fontSize: "11px", padding: "2px", opacity: 0.8,
+                            transition: "color 0.15s",
+                          }}>{copied[i] ? <Check size={14} /> : <Copy size={14} />}</button>
+                        )}
+                      </motion.div>
+                    </div>
+
+                    {m.slots && !m.slotsUsed && !m.typing && !m.availableDays && (
+                      <div style={{ display: "flex", flexDirection: "column", gap: "6px", paddingLeft: "2px", maxWidth: "88%" }}>
+                        {m.slots.map((slot, si) => (
+                          <button
+                            key={si}
+                            onClick={() => pickSlot(i, slot)}
+                            style={{
+                              background: "#EBF2FF", border: `1px solid ${C.sugText}`,
+                              borderRadius: "10px", padding: "9px 14px",
+                              fontSize: "13px", color: C.sugText, fontWeight: 600,
+                              cursor: "pointer", fontFamily: BODY, textAlign: "left",
+                              display: "flex", alignItems: "center", gap: "7px",
+                              transition: "background 0.15s",
+                            }}
+                          >
+                            <Calendar size={13} strokeWidth={2} />
+                            {slot}
+                          </button>
+                        ))}
+                      </div>
+                    )}
+
+                    {m.availableDays && !m.slotsUsed && !m.typing && (
+                      <div style={{ paddingLeft: "2px", width: "100%" }}>
+                        <BookingCalendar
+                          availableDays={m.availableDays}
+                          msgIndex={i}
+                          onPickSlot={pickSlot}
+                          slotsUsed={m.slotsUsed}
+                          primaryColor={config.primaryColor}
+                          navyColor={config.navyColor}
+                        />
+                      </div>
+                    )}
+
+                    {m.sender === "bot" && !m.isError && !m.typing && (
+                      <div style={{ display: "flex", alignItems: "center", gap: "5px", flexWrap: "wrap", paddingLeft: "2px" }}>
+                        {feedback[i] ? (
+                          <span style={{ fontSize: "10px", color: C.textMuted }}>
+                            {feedback[i] === "up" ? "Thanks for the feedback!" : "We'll improve this!"}
+                          </span>
+                        ) : (
+                          <>
+                            <button onClick={() => setFeedback(p => ({ ...p, [i]: "up" }))} style={{
+                              background: "none", border: "none", cursor: "pointer", padding: "1px", opacity: 0.65,
+                              color: C.textMuted, display: "flex", alignItems: "center",
+                            }}><ThumbsUp size={12} /></button>
+                            <button onClick={() => setFeedback(p => ({ ...p, [i]: "down" }))} style={{
+                              background: "none", border: "none", cursor: "pointer", padding: "1px", opacity: 0.65,
+                              color: C.textMuted, display: "flex", alignItems: "center",
+                            }}><ThumbsDown size={12} /></button>
+                          </>
+                        )}
+                        {i === messages.length - 1 && !thinking && !m.slots && (
+                          <>
+                            <span style={{ fontSize: "10px", color: C.border }}>|</span>
+                            <button onClick={() => sendMessage("Can you simplify that?")} style={{
+                              background: "none", border: `1px solid ${C.border}`, borderRadius: "10px",
+                              padding: "1px 7px", fontSize: "10px", color: C.textMuted,
+                              cursor: "pointer", fontFamily: BODY, transition: "all 0.15s",
+                            }}>Simplify</button>
+                            <button onClick={() => sendMessage("Can you give more detail on that?")} style={{
+                              background: "none", border: `1px solid ${C.border}`, borderRadius: "10px",
+                              padding: "1px 7px", fontSize: "10px", color: C.textMuted,
+                              cursor: "pointer", fontFamily: BODY, transition: "all 0.15s",
+                            }}>More detail</button>
+                          </>
+                        )}
+                      </div>
+                    )}
+                  </>
+                )}
+              </motion.div>
+            ))}
+            </AnimatePresence>
+
+            <AnimatePresence>
+              {thinking && (
+                <motion.div
+                  initial={{ opacity: 0, y: 8, scale: 0.95 }}
+                  animate={{ opacity: 1, y: 0, scale: 1 }}
+                  exit={{ opacity: 0, y: 8, scale: 0.95 }}
+                  transition={{ duration: 0.2, ease: "easeOut" }}
+                  style={{ display: "flex", justifyContent: "flex-start", alignItems: "flex-end", gap: "8px" }}
+                >
+                  <div style={{
+                    width: "28px", height: "28px", borderRadius: "50%", flexShrink: 0,
+                    overflow: "hidden", boxShadow: "0 2px 8px rgba(0,0,0,0.15)",
+                  }}>
+                    <img src={config.logoUrl} alt="" style={{ width: "100%", height: "100%", objectFit: "cover", display: "block" }} />
+                  </div>
+                  <div style={{
+                    background: "#FFFFFF", borderRadius: "20px 20px 20px 4px",
+                    padding: "10px 14px", display: "flex", gap: "8px", alignItems: "center",
+                    border: "1px solid rgba(0,122,227,0.1)", boxShadow: "0 2px 10px rgba(0,0,0,0.05)",
+                  }}>
+                    <div style={{ display: "flex", gap: "5px", alignItems: "center" }}>
+                      {[0, 1, 2].map(d => (
+                        <motion.span
+                          key={d}
+                          style={{
+                            width: "7px", height: "7px", borderRadius: "50%",
+                            background: C.textMuted, display: "block",
+                          }}
+                          animate={{ opacity: [0.4, 1, 0.4], y: [0, -5, 0] }}
+                          transition={{ duration: 0.8, repeat: Infinity, delay: d * 0.15, ease: "easeInOut" }}
+                        />
+                      ))}
+                    </div>
+                    <span style={{ fontSize: "12px", color: C.textMuted }}>
+                      {thinkingMode === "booking" ? "Checking availability..." : "Thinking..."}
+                    </span>
+                  </div>
+                </motion.div>
+              )}
+            </AnimatePresence>
+
+            <div ref={chatEndRef} />
+          </div>
+
+          {/* Suggestions */}
+          <div style={{ padding: "6px 12px 4px", background: C.bg, borderTop: `1px solid ${C.border}` }}>
+            <div style={{
+              display: "flex", gap: "5px", flexWrap: "wrap",
+              opacity: sugsVisible ? 1 : 0,
+              transform: sugsVisible ? "translateY(0)" : "translateY(4px)",
+              transition: "opacity 0.15s ease, transform 0.15s ease",
+            }}>
+              {suggestions.map((s, i) => (
+                <button key={i} className="chat-chip" onClick={() => { setInput(s); inputRef.current?.focus(); }} style={{
+                  background: C.sugBg, border: `1px solid ${C.sugBorder}`, borderRadius: "20px",
+                  padding: "4px 11px", fontSize: "11px", color: C.sugText,
+                  cursor: "pointer", fontFamily: BODY, whiteSpace: "nowrap",
+                  maxWidth: "calc(100% - 4px)", overflow: "hidden", textOverflow: "ellipsis",
+                  transition: "all 0.15s ease",
+                }}>{s}</button>
+              ))}
+            </div>
+          </div>
+
+          {/* Input */}
+          <div style={{
+            padding: "8px 12px", borderTop: `1px solid ${C.border}`,
+            display: "flex", gap: "8px", flexShrink: 0, background: C.bg,
+          }}>
+            <input
+              ref={inputRef}
+              value={input}
+              onChange={e => setInput(e.target.value)}
+              onKeyDown={handleKey}
+              disabled={thinking}
+              placeholder="Write your message..."
+              style={{
+                flex: 1, padding: "10px 14px",
+                border: `1px solid ${C.inputBorder}`, borderRadius: "20px",
+                fontSize: "16px", fontFamily: BODY, outline: "none",
+                background: thinking ? C.msgBg : C.inputBg, color: C.text,
+                transition: "border-color 0.2s, background 0.2s",
+              }}
+            />
+            <motion.button
+              onClick={() => sendMessage(input)}
+              disabled={thinking || !input.trim()}
+              whileHover={!thinking && input.trim() ? { scale: 1.08 } : {}}
+              whileTap={!thinking && input.trim() ? { scale: 0.92 } : {}}
+              style={{
+                background: thinking || !input.trim() ? "#94a3b8" : config.primaryColor,
+                border: "none", color: "#FFFFFF",
+                width: "40px", height: "40px", borderRadius: "50%",
+                display: "flex", alignItems: "center", justifyContent: "center",
+                cursor: thinking || !input.trim() ? "not-allowed" : "pointer",
+                flexShrink: 0, transition: "background 0.2s ease",
+              }}
+            >
+              <Send size={16} />
+            </motion.button>
+          </div>
+
+          {/* Quick actions */}
+          <div style={{
+            padding: "3px 12px 10px", display: "flex", gap: "14px",
+            background: C.bg, borderRadius: fRad,
+          }}>
+            <button onClick={clearChat} style={{
+              background: "none", border: "none", cursor: "pointer",
+              fontSize: "11px", color: C.actionText, fontFamily: BODY, padding: "2px 0",
+              transition: "color 0.15s",
+            }}>Clear Chat</button>
+            <button onClick={copyLast} style={{
+              background: "none", border: "none", cursor: "pointer",
+              fontSize: "11px", color: copiedLast ? "#34d399" : C.actionText,
+              fontFamily: BODY, padding: "2px 0", transition: "color 0.15s",
+            }}>{copiedLast ? "Copied!" : "Copy Last Response"}</button>
+          </div>
+        </div>
+      )}
+
+      {/* Floating bubble */}
+      <button
+        onClick={() => setOpen(o => !o)}
+        aria-label={open ? "Close chat" : `Open ${config.businessName} chat`}
+        style={{
+          position: "fixed", bottom: "24px", right: "24px", zIndex: 9999,
+          width: "60px", height: "60px", borderRadius: "50%",
+          background: "transparent", border: "none", cursor: "pointer",
+          padding: 0, overflow: "hidden",
+          boxShadow: "0 4px 24px rgba(0,0,0,0.22)",
+          transition: "transform 0.2s ease, box-shadow 0.2s ease",
+        }}
+      >
+        {open ? (
+          <div style={{
+            width: "60px", height: "60px", borderRadius: "50%",
+            background: config.primaryColor, display: "flex", alignItems: "center", justifyContent: "center",
+          }}>
+            <span style={{ color: "#FFFFFF", fontSize: "20px", fontWeight: 700 }}><X size={18} /></span>
+          </div>
+        ) : (
+          <img
+            src={config.logoUrl}
+            alt={config.businessName}
+            style={{ width: "60px", height: "60px", borderRadius: "50%", objectFit: "cover", display: "block" }}
+          />
+        )}
+      </button>
+    </>
+  );
+}
