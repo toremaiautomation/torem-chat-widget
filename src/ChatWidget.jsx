@@ -220,6 +220,9 @@ export default function ChatWidget({ config }) {
   const [showSkeleton, setShowSkeleton] = useState(false);
   const [thinkingMode, setThinkingMode] = useState("normal");
   const [chatSize, setChatSize] = useState({ width: 400, height: 600 });
+  const [pendingSlot, setPendingSlot] = useState(null);
+  const [customerForm, setCustomerForm] = useState({ name: '', phone: '', email: '', notes: '' });
+  const [customerErrors, setCustomerErrors] = useState({});
 
   const sessionId   = useRef(String(Date.now()));
   const chatEndRef  = useRef(null);
@@ -291,16 +294,18 @@ export default function ChatWidget({ config }) {
     resizeStart.current = { x: e.clientX, y: e.clientY, w: chatSize.width, h: chatSize.height };
   };
 
-  const sendToN8N = async (userMessage) => {
+  const sendToN8N = async (userMessage, customer = null) => {
     try {
+      const payload = {
+        message:   userMessage,
+        sessionId: sessionId.current,
+        clientId:  config.clientId,   // routes to this client's config + calendar
+      };
+      if (customer) payload.customer = customer;
       const response = await fetch(CHAT_WEBHOOK_URL, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          message:   userMessage,
-          sessionId: sessionId.current,
-          clientId:  config.clientId,   // routes to this client's config + calendar
-        }),
+        body: JSON.stringify(payload),
       });
 
       const text = await response.text();
@@ -362,21 +367,48 @@ export default function ChatWidget({ config }) {
     }, 15);
   };
 
-  const sendMessage = async (text) => {
+  const sendMessage = async (text, customer = null) => {
     const msg = text.trim();
     if (!msg || thinking) return;
     setThinkingMode(config.enabledWorkflows.booking && BOOKING_INTENT_RE.test(msg) ? "booking" : "normal");
     setMessages(prev => [...prev, { sender: "user", text: msg }]);
     setInput("");
     setThinking(true);
-    const { aiMessage, availableDays } = await sendToN8N(msg);
+    const { aiMessage, availableDays } = await sendToN8N(msg, customer);
     setThinking(false);
     startTyping(aiMessage, availableDays);
   };
 
+  const validateCustomerForm = (form) => {
+    const errors = {};
+    const name = form.name.trim();
+    if (!name || name.length < 2) errors.name = 'Full name is required (at least 2 characters).';
+    else if (name.length > 80) errors.name = 'Name must be 80 characters or fewer.';
+    const digits = form.phone.replace(/\D/g, '');
+    if (!digits || digits.length < 10) errors.phone = 'A valid phone number is required (at least 10 digits).';
+    if (form.email && !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(form.email)) errors.email = 'Enter a valid email address.';
+    return errors;
+  };
+
+  const confirmBooking = () => {
+    const errors = validateCustomerForm(customerForm);
+    if (Object.keys(errors).length > 0) { setCustomerErrors(errors); return; }
+    const customer = {
+      name:  customerForm.name.trim(),
+      phone: customerForm.phone.trim(),
+      email: customerForm.email.trim(),
+      notes: customerForm.notes.trim(),
+    };
+    const { slot } = pendingSlot;
+    setPendingSlot(null);
+    sendMessage(`I'll take ${slot}`, customer);
+  };
+
   const pickSlot = (msgIndex, slot) => {
     setMessages(prev => prev.map((m, i) => i === msgIndex ? { ...m, slotsUsed: true } : m));
-    sendMessage(`I'll take ${slot}`);
+    setCustomerForm({ name: '', phone: '', email: '', notes: '' });
+    setCustomerErrors({});
+    setPendingSlot({ msgIndex, slot });
   };
 
   const retryLast = async () => {
@@ -401,6 +433,9 @@ export default function ChatWidget({ config }) {
     setFeedback({});
     setCopied({});
     setInput("");
+    setPendingSlot(null);
+    setCustomerForm({ name: '', phone: '', email: '', notes: '' });
+    setCustomerErrors({});
   };
 
   const copyMsg = (i, text) => {
@@ -720,6 +755,74 @@ export default function ChatWidget({ config }) {
                 </motion.div>
               )}
             </AnimatePresence>
+
+            {pendingSlot && (
+              <motion.div
+                initial={{ opacity: 0, y: 12 }}
+                animate={{ opacity: 1, y: 0 }}
+                transition={{ duration: 0.25, ease: [0.22, 1, 0.36, 1] }}
+                style={{ background: "#FFFFFF", border: "1px solid rgba(0,122,227,0.15)", borderRadius: "14px", padding: "16px", width: "100%", boxSizing: "border-box" }}
+              >
+                <p style={{ fontSize: "13px", fontWeight: 700, color: config.navyColor, marginBottom: "12px", fontFamily: DISPLAY }}>Your details</p>
+
+                <div style={{ marginBottom: "10px" }}>
+                  <label style={{ fontSize: "11px", fontWeight: 600, color: config.navyColor, display: "block", marginBottom: "4px" }}>Full name *</label>
+                  <input
+                    value={customerForm.name}
+                    onChange={e => { setCustomerForm(f => ({ ...f, name: e.target.value })); setCustomerErrors(err => ({ ...err, name: undefined })); }}
+                    maxLength={80}
+                    placeholder="Jane Smith"
+                    style={{ width: "100%", boxSizing: "border-box", padding: "9px 12px", border: `1px solid ${customerErrors.name ? "#FCA5A5" : "rgba(0,122,227,0.2)"}`, borderRadius: "8px", fontSize: "13px", fontFamily: BODY, outline: "none", background: "#FAFCFF", color: config.navyColor }}
+                  />
+                  {customerErrors.name && <p style={{ fontSize: "11px", color: "#DC2626", marginTop: "3px" }}>{customerErrors.name}</p>}
+                </div>
+
+                <div style={{ marginBottom: "10px" }}>
+                  <label style={{ fontSize: "11px", fontWeight: 600, color: config.navyColor, display: "block", marginBottom: "4px" }}>Phone *</label>
+                  <input
+                    value={customerForm.phone}
+                    onChange={e => { setCustomerForm(f => ({ ...f, phone: e.target.value })); setCustomerErrors(err => ({ ...err, phone: undefined })); }}
+                    placeholder="(555) 000-0000"
+                    style={{ width: "100%", boxSizing: "border-box", padding: "9px 12px", border: `1px solid ${customerErrors.phone ? "#FCA5A5" : "rgba(0,122,227,0.2)"}`, borderRadius: "8px", fontSize: "13px", fontFamily: BODY, outline: "none", background: "#FAFCFF", color: config.navyColor }}
+                  />
+                  {customerErrors.phone && <p style={{ fontSize: "11px", color: "#DC2626", marginTop: "3px" }}>{customerErrors.phone}</p>}
+                </div>
+
+                <div style={{ marginBottom: "10px" }}>
+                  <label style={{ fontSize: "11px", fontWeight: 600, color: config.navyColor, display: "block", marginBottom: "4px" }}>Email <span style={{ fontWeight: 400, color: "#94a3b8" }}>(optional)</span></label>
+                  <input
+                    value={customerForm.email}
+                    onChange={e => { setCustomerForm(f => ({ ...f, email: e.target.value })); setCustomerErrors(err => ({ ...err, email: undefined })); }}
+                    placeholder="jane@example.com"
+                    style={{ width: "100%", boxSizing: "border-box", padding: "9px 12px", border: `1px solid ${customerErrors.email ? "#FCA5A5" : "rgba(0,122,227,0.2)"}`, borderRadius: "8px", fontSize: "13px", fontFamily: BODY, outline: "none", background: "#FAFCFF", color: config.navyColor }}
+                  />
+                  {customerErrors.email && <p style={{ fontSize: "11px", color: "#DC2626", marginTop: "3px" }}>{customerErrors.email}</p>}
+                </div>
+
+                <div style={{ marginBottom: "12px" }}>
+                  <label style={{ fontSize: "11px", fontWeight: 600, color: config.navyColor, display: "block", marginBottom: "4px" }}>Notes <span style={{ fontWeight: 400, color: "#94a3b8" }}>(optional)</span></label>
+                  <textarea
+                    value={customerForm.notes}
+                    onChange={e => setCustomerForm(f => ({ ...f, notes: e.target.value }))}
+                    maxLength={300}
+                    placeholder="Address or what you need help with"
+                    rows={2}
+                    style={{ width: "100%", boxSizing: "border-box", padding: "9px 12px", border: "1px solid rgba(0,122,227,0.2)", borderRadius: "8px", fontSize: "13px", fontFamily: BODY, outline: "none", background: "#FAFCFF", color: config.navyColor, resize: "none" }}
+                  />
+                  <p style={{ fontSize: "10px", color: "#94a3b8", textAlign: "right", marginTop: "2px" }}>{customerForm.notes.length}/300</p>
+                </div>
+
+                <p style={{ fontSize: "11px", color: "#94a3b8", marginBottom: "10px" }}>We'll only use this to confirm your appointment.</p>
+
+                <button
+                  onClick={confirmBooking}
+                  disabled={thinking}
+                  style={{ width: "100%", padding: "10px 16px", background: thinking ? "#94a3b8" : config.primaryColor, color: "#FFFFFF", border: "none", borderRadius: "8px", fontSize: "13px", fontWeight: 600, cursor: thinking ? "not-allowed" : "pointer", fontFamily: BODY, transition: "background 0.15s" }}
+                >
+                  {thinking ? "Booking…" : "Confirm appointment"}
+                </button>
+              </motion.div>
+            )}
 
             <div ref={chatEndRef} />
           </div>
