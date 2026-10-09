@@ -386,7 +386,10 @@ export default function ChatWidget({ config }) {
     else if (name.length > 80) errors.name = 'Name must be 80 characters or fewer.';
     const digits = form.phone.replace(/\D/g, '');
     if (!digits || digits.length < 10) errors.phone = 'A valid phone number is required (at least 10 digits).';
-    if (form.email && !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(form.email)) errors.email = 'Enter a valid email address.';
+    const email = form.email.trim();
+    if (!email) errors.email = 'Enter an email so we can send your confirmation.';
+    else if (email.length > 120) errors.email = 'Enter an email so we can send your confirmation.';
+    else if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) errors.email = 'Enter an email so we can send your confirmation.';
     return errors;
   };
 
@@ -789,10 +792,12 @@ export default function ChatWidget({ config }) {
                 </div>
 
                 <div style={{ marginBottom: "10px" }}>
-                  <label style={{ fontSize: "11px", fontWeight: 600, color: config.navyColor, display: "block", marginBottom: "4px" }}>Email <span style={{ fontWeight: 400, color: "#94a3b8" }}>(optional)</span></label>
+                  <label style={{ fontSize: "11px", fontWeight: 600, color: config.navyColor, display: "block", marginBottom: "4px" }}>Email (we'll send your confirmation here) *</label>
                   <input
+                    type="email"
                     value={customerForm.email}
                     onChange={e => { setCustomerForm(f => ({ ...f, email: e.target.value })); setCustomerErrors(err => ({ ...err, email: undefined })); }}
+                    maxLength={120}
                     placeholder="jane@example.com"
                     style={{ width: "100%", boxSizing: "border-box", padding: "9px 12px", border: `1px solid ${customerErrors.email ? "#FCA5A5" : "rgba(0,122,227,0.2)"}`, borderRadius: "8px", fontSize: "13px", fontFamily: BODY, outline: "none", background: "#FAFCFF", color: config.navyColor }}
                   />
